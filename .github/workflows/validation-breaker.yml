@@ -24,7 +24,7 @@ jobs:
           python-version: '3.12'
       - name: Run iteration
         env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_PAT: ${{ secrets.GITHUB_TOKEN }}
         run: python3 scripts/iterate.py
       - name: Commit and push
         run: |
@@ -32,7 +32,7 @@ jobs:
           git config user.email 'bot@validation-breaker'
           git add -A
           if git diff --cached --quiet; then
-            echo 'no changes'
+            echo 'no changes this iter'
             exit 0
           fi
           ITER=$(cat iter_count.txt 2>/dev/null || echo '?')
