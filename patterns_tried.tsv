@@ -1,1 +1,11 @@
 iter	lang	class	query
+1	rust	unanchored-regex	"Regex::new" "is_match" "reqwest" language:Rust
+1	ts	unanchored-regex	"RegExp" "test" "hostname" language:TypeScript
+1	php	ssrf-parser	"parse_url" "host" "file_get_contents" language:PHP
+1	go	ssrf-parser	"url.Parse" ".Host" "http.Get" language:Go
+1	python	ssrf-parser	"urlparse" "netloc" "requests.get" language:Python
+1	java	deserialization	"ObjectInputStream" "readObject" language:Java
+1	go	unanchored-regex	"regexp.MatchString" "host" language:Go
+1	js	deserialization	"JSON.parse" "req.body" "eval" language:JavaScript
+1	js	unanchored-regex	"new RegExp" ".test(" "allowed" language:JavaScript
+1	java	ssrf-url-parser	"new URL" ".getHost()" language:Java

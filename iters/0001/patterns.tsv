@@ -1,0 +1,11 @@
+lang	class	query
+rust	unanchored-regex	"Regex::new" "is_match" "reqwest" language:Rust
+ts	unanchored-regex	"RegExp" "test" "hostname" language:TypeScript
+php	ssrf-parser	"parse_url" "host" "file_get_contents" language:PHP
+go	ssrf-parser	"url.Parse" ".Host" "http.Get" language:Go
+python	ssrf-parser	"urlparse" "netloc" "requests.get" language:Python
+java	deserialization	"ObjectInputStream" "readObject" language:Java
+go	unanchored-regex	"regexp.MatchString" "host" language:Go
+js	deserialization	"JSON.parse" "req.body" "eval" language:JavaScript
+js	unanchored-regex	"new RegExp" ".test(" "allowed" language:JavaScript
+java	ssrf-url-parser	"new URL" ".getHost()" language:Java
