@@ -13,18 +13,64 @@ MAX_ANALYZE    = int(os.environ.get('VB_MAX_ANALYZE', '20'))
 MAX_PATTERNS   = int(os.environ.get('VB_MAX_PATTERNS', '100'))
 TIME_BUDGET    = int(os.environ.get('VB_TIME_BUDGET', '840'))
 T0 = time.time()
+DEBUG = os.environ.get('VB_DEBUG', '1') not in ('0','false','no','')
 def over_budget(): return time.time() - T0 > TIME_BUDGET
 
 def log(step, status, detail=''):
     print(f"{time.strftime('%H:%M:%S')} {step} {status} {detail}", flush=True)
 
+_current_run_id = None
+_current_target_id = None
+
+def redact(s):
+    if not s: return s
+    s = str(s)
+    for k in ('OPENROUTER_API_KEY','GH_PAT','NEON_DATABASE_URL'):
+        v = os.environ.get(k,'')
+        if v and len(v) > 8: s = s.replace(v, f'***{k}***')
+    # also redact any Bearer token, Authorization headers, urlencoded user:pass
+    import re as _re
+    s = _re.sub(r'(Bearer\s+)[A-Za-z0-9_\-\.=+/]{8,}', r'\1***', s)
+    s = _re.sub(r'(://[^/@\s]+:)[^@\s]+@', r'\1***@', s)
+    return s
+
+def debug(kind, endpoint=None, status_code=None, duration_ms=None, body=None):
+    if not DEBUG: return
+    try:
+        preview = None
+        if body is not None:
+            if isinstance(body, (dict, list)): body = json.dumps(body)[:4000]
+            elif isinstance(body, bytes):       body = body[:4000].decode('utf-8', errors='replace')
+            preview = redact(str(body))[:4000]
+        # use a short-lived connection to avoid clashing with the main cursor's transaction
+        c = psycopg.connect(DB_URL, autocommit=True)
+        cc = c.cursor()
+        cc.execute("INSERT INTO bounty_hunt.debug_events(run_id, target_id, kind, endpoint, status_code, duration_ms, body_preview) VALUES(%s,%s,%s,%s,%s,%s,%s)",
+                   (_current_run_id, _current_target_id, kind, redact(endpoint) if endpoint else None, status_code, duration_ms, preview))
+        cc.close(); c.close()
+    except Exception as e:
+        print(f"[debug-fail] {e}", flush=True)
+
 def http(method, url, headers=None, body=None, timeout=60):
     data = json.dumps(body).encode() if isinstance(body, (dict,list)) else body
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
+    debug('http_req', endpoint=f"{method} {url}", body=body if body else None)
+    t = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r: return r.status, r.read()
-    except urllib.error.HTTPError as e: return e.code, e.read()
-    except Exception as e: return 0, repr(e).encode()
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            content = r.read()
+            ms = int((time.time()-t)*1000)
+            debug('http_resp', endpoint=url, status_code=r.status, duration_ms=ms, body=content)
+            return r.status, content
+    except urllib.error.HTTPError as e:
+        content = e.read()
+        ms = int((time.time()-t)*1000)
+        debug('http_resp', endpoint=url, status_code=e.code, duration_ms=ms, body=content)
+        return e.code, content
+    except Exception as e:
+        ms = int((time.time()-t)*1000)
+        debug('http_err', endpoint=url, duration_ms=ms, body=repr(e))
+        return 0, repr(e).encode()
 
 GH_HDR = {'Authorization': f'Bearer {GH_TOKEN}', 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'vb-bot'}
 OR_HDR = {'Authorization': f'Bearer {OPENROUTER_KEY}', 'Content-Type': 'application/json',
@@ -37,7 +83,9 @@ cur = conn.cursor()
 cur.execute("INSERT INTO bounty_hunt.runs(started_at, status, note) VALUES(NOW(), 'running', %s) RETURNING id",
             (f"model={MODEL}",))
 run_id = cur.fetchone()[0]
+_current_run_id = run_id
 log('run', 'start', f'id={run_id} model={MODEL}')
+debug('iter_start', body={'run_id': run_id, 'model': MODEL, 'max_patterns': MAX_PATTERNS, 'max_hits': MAX_HITS, 'max_analyze': MAX_ANALYZE, 'time_budget': TIME_BUDGET})
 
 MASTER = [
     ('python','ssrf-suffix','"urlparse" "hostname" ".endswith(" language:Python',3),
@@ -299,6 +347,8 @@ def hermes_deep_analyze(src, repo, path, prior_attempt):
               f"expected_marker, impact, severity, confidence, explanation, suggested_fix, markdown. "
               f"verification_python must print 'VB_BYPASS_VERIFIED' to stdout iff the payload works. "
               f"No fabrication — if there is no real bypass, set exploitable=false.")
+    debug('hermes_req', endpoint='/hermes/cli.py', body={'repo': repo, 'path': path, 'prompt_len': len(prompt)})
+    t = time.time()
     try:
         r = subprocess.run(
             ['python', '/hermes/cli.py', '--query', prompt, '--quiet'],
@@ -306,10 +356,13 @@ def hermes_deep_analyze(src, repo, path, prior_attempt):
             env={**os.environ, 'HOME': '/root'}
         )
         out = (r.stdout or '') + (r.stderr or '')
+        ms = int((time.time()-t)*1000)
+        debug('hermes_resp', endpoint='/hermes/cli.py', duration_ms=ms, status_code=r.returncode, body=out[:4000])
         m = re.search(r'\{[\s\S]*\}', out)
         if m:
             return json.loads(m.group(0))
     except Exception as e:
+        debug('hermes_err', body=repr(e)[:500])
         log('hermes', 'fail', repr(e)[:100])
     return None
 
@@ -331,6 +384,8 @@ analyzed = 0; verified = 0; hermes_retries = 0; MAX_HERMES_RETRIES = 3
 for target in targets:
     if over_budget(): break
     analyzed += 1
+    _current_target_id = target['target_id']
+    debug('target_start', body={'target_id': target['target_id'], 'repo': target['repo'], 'path': target['path'], 'pattern': target['pattern_id'], 'rank': eligible.index(target)+1 if target in eligible else None})
     raw_url = f'https://raw.githubusercontent.com/{target["repo"]}/{target["sha"]}/{target["path"]}'
     code, body = http('GET', raw_url, headers=GH_HDR)
     if code != 200:
@@ -350,7 +405,9 @@ for target in targets:
         content = resp['choices'][0]['message']['content']
         content = re.sub(r'^```(?:json)?\s*|\s*```$', '', content.strip(), flags=re.MULTILINE)
         a = json.loads(content)
-    except Exception:
+        debug('llm_parsed', body={'exploitable': a.get('exploitable'), 'class': a.get('class'), 'confidence': a.get('confidence'), 'title': a.get('title'), 'has_payload': bool(a.get('bypass_payload')), 'has_verification': bool(a.get('verification_python'))})
+    except Exception as e:
+        debug('llm_parse_fail', body=repr(e) + ' :: raw=' + (content[:1000] if 'content' in dir() else '?'))
         cur.execute("UPDATE bounty_hunt.targets SET status='parse_failed' WHERE id=%s", (target['target_id'],))
         continue
 
@@ -396,5 +453,6 @@ for target in targets:
 
 cur.execute("UPDATE bounty_hunt.runs SET finished_at=NOW(), status='succeeded', note=%s WHERE id=%s",
             (f"hits={len(all_hits)} eligible={len(eligible)} analyzed={analyzed} verified={verified} hermes_retries={hermes_retries}", run_id))
+debug('iter_done', body={'hits': len(all_hits), 'eligible': len(eligible), 'analyzed': analyzed, 'verified': verified, 'hermes_retries': hermes_retries, 'elapsed_s': int(time.time()-T0)})
 cur.close(); conn.close()
 print(f"\niter run_id={run_id}: {len(all_hits)} hits, {len(eligible)} eligible, {analyzed} analyzed, {verified} verified")
