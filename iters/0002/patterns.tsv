@@ -1,0 +1,11 @@
+lang	class	query
+ruby	ssrf-url-parser	"URI.parse" ".host" "Net::HTTP" language:Ruby
+kotlin	deserialization	"ObjectMapper" "readValue" language:Kotlin
+python	prompt-injection	"re.search" "ignore previous" language:Python
+python	unanchored-regex	"re.search" "host" "requests" language:Python
+rust	ssrf-url-parser	"Url::parse" ".host_str" language:Rust
+java	unicode-gap	".toLowerCase()" "equals" "allowed" language:Java
+ruby	unanchored-regex	"=~" "host" "http.get" language:Ruby
+js	unicode-gap	".toLowerCase()" "includes" "host" language:JavaScript
+kotlin	ssrf-url-parser	"URL(" ".host" language:Kotlin
+csharp	ssrf-url-parser	"new Uri" ".Host" "HttpClient" language:C#

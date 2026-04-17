@@ -9,3 +9,13 @@ iter	lang	class	query
 1	js	deserialization	"JSON.parse" "req.body" "eval" language:JavaScript
 1	js	unanchored-regex	"new RegExp" ".test(" "allowed" language:JavaScript
 1	java	ssrf-url-parser	"new URL" ".getHost()" language:Java
+2	ruby	ssrf-url-parser	"URI.parse" ".host" "Net::HTTP" language:Ruby
+2	kotlin	deserialization	"ObjectMapper" "readValue" language:Kotlin
+2	python	prompt-injection	"re.search" "ignore previous" language:Python
+2	python	unanchored-regex	"re.search" "host" "requests" language:Python
+2	rust	ssrf-url-parser	"Url::parse" ".host_str" language:Rust
+2	java	unicode-gap	".toLowerCase()" "equals" "allowed" language:Java
+2	ruby	unanchored-regex	"=~" "host" "http.get" language:Ruby
+2	js	unicode-gap	".toLowerCase()" "includes" "host" language:JavaScript
+2	kotlin	ssrf-url-parser	"URL(" ".host" language:Kotlin
+2	csharp	ssrf-url-parser	"new Uri" ".Host" "HttpClient" language:C#

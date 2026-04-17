@@ -1,0 +1,10 @@
+{"iter": 2, "lang": "ruby", "class": "ssrf-url-parser", "repo": "jedi4ever/veewee", "path": "Rakefile", "sha": "953658eb3e0c13dc9b33a535a64c35ef0042c0a7", "score": 1.0}
+{"iter": 2, "lang": "ruby", "class": "ssrf-url-parser", "repo": "pickhardt/betty", "path": "main.rb", "sha": "f33ba466ac6e2adc5e87304e6ca545eb9e90170c", "score": 1.0}
+{"iter": 2, "lang": "ruby", "class": "ssrf-url-parser", "repo": "augustl/net-http-cheat-sheet", "path": "proxy.rb", "sha": "d9f181a46ef491efc409111edaec25eab5e87aea", "score": 1.0}
+{"iter": 2, "lang": "ruby", "class": "ssrf-url-parser", "repo": "rails-sqlserver/activerecord-sqlserver-adapter", "path": "Gemfile", "sha": "f4e099ca4733b6c47c66dc4cb3281fd913a1f5cf", "score": 1.0}
+{"iter": 2, "lang": "ruby", "class": "ssrf-url-parser", "repo": "0xsauby/yasuo", "path": "yasuo.rb", "sha": "099a1e31e857baa6e10c74cf10a0e675d1e729f5", "score": 1.0}
+{"iter": 2, "lang": "ruby", "class": "ssrf-url-parser", "repo": "tagtime/TagTime", "path": "beemapi.rb", "sha": "151f10a56cfee133902b2add95148f9cd5165319", "score": 1.0}
+{"iter": 2, "lang": "ruby", "class": "ssrf-url-parser", "repo": "powder-rb/powder", "path": "bin/powder", "sha": "15ad81676da565d4bfbd1503daef68d929a137c0", "score": 1.0}
+{"iter": 2, "lang": "ruby", "class": "ssrf-url-parser", "repo": "idonethis/didit-cli-client", "path": "didit.rb", "sha": "c7944cf891754b08a39fe5dff887869989df499c", "score": 1.0}
+{"iter": 2, "lang": "ruby", "class": "ssrf-url-parser", "repo": "sshaw/itunes_store_transporter", "path": "bin/itms", "sha": "ab1b44cb7039879bc94f114c42354cc6677334ae", "score": 1.0}
+{"iter": 2, "lang": "ruby", "class": "ssrf-url-parser", "repo": "Kunstmaan/kStrano", "path": "bin/kumafy", "sha": "f0938b0f59b47b8f1271d337696395489b93df7d", "score": 1.0}
