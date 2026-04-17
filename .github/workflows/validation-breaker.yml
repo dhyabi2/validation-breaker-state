@@ -1,4 +1,4 @@
-name: validation-breaker
+name: hermes-validation-breaker
 on:
   schedule:
     - cron: '0 * * * *'
@@ -12,26 +12,54 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  iterate:
+  hermes-iter:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout state repo
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install deps
-        run: pip install --quiet 'psycopg[binary]'
-      - name: Run iteration
+
+      - name: Install Hermes agent from Nous Research
+        run: |
+          git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /tmp/hermes
+          cd /tmp/hermes
+          pip install --quiet -e .
+          pip install --quiet 'psycopg[binary]'
+
+      - name: Seed Hermes config
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NEON_DATABASE_URL:  ${{ secrets.NEON_DATABASE_URL }}
           GH_PAT:             ${{ secrets.GH_PAT }}
-          VB_MODEL:           google/gemma-4-31b-it:free
-        run: python3 scripts/iterate.py
-      - name: Commit progress.log and LATEST.md
+        run: |
+          mkdir -p ~/.hermes/skills/security/validation-breaker
+          cp skills/validation-breaker/SKILL.md ~/.hermes/skills/security/validation-breaker/SKILL.md
+          cat > ~/.hermes/.env <<EOF
+          OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+          NEON_DATABASE_URL=${NEON_DATABASE_URL}
+          GH_PAT=${GH_PAT}
+          EOF
+
+      - name: Run Hermes one-shot with validation-breaker skill
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          NEON_DATABASE_URL:  ${{ secrets.NEON_DATABASE_URL }}
+          GH_PAT:             ${{ secrets.GH_PAT }}
+        working-directory: /tmp/hermes
+        run: |
+          timeout 900 python cli.py \
+            --query "Run one iteration of the validation-breaker skill. Execute the bash command in the skill file. Do not ask questions." \
+            --skills validation-breaker \
+            --quiet \
+            || echo "hermes exit $?"
+
+      - name: Commit progress
         if: always()
         run: |
           git config user.name  'vb-bot'
@@ -40,6 +68,6 @@ jobs:
           if git diff --cached --quiet; then
             echo 'no diff this iter'
           else
-            git commit -m "iter: $(head -1 LATEST.md 2>/dev/null || date -u +iter-%FT%T)"
+            git commit -m "hermes iter: $(date -u +%FT%TZ)"
             git push
           fi
