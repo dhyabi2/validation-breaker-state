@@ -1,0 +1,40 @@
+name: validation-breaker
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: validation-breaker
+  cancel-in-progress: false
+
+jobs:
+  iterate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run iteration
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: python3 scripts/iterate.py
+      - name: Commit and push
+        run: |
+          git config user.name 'vb-bot'
+          git config user.email 'bot@validation-breaker'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'no changes'
+            exit 0
+          fi
+          ITER=$(cat iter_count.txt 2>/dev/null || echo '?')
+          git commit -m "iter $ITER"
+          git push
