@@ -1,225 +1,194 @@
 #!/usr/bin/env python3
-"""Validation-breaker: one iteration. Runs in GitHub Actions.
-Generates ~100 patterns, collects up to 10k hits, filters to bounty-eligible,
-uses Gemma via OpenRouter to find real bypass bugs, verifies PoC locally,
-persists to Neon. Writes progress.log for repo-visible checkpoint."""
-import base64, json, os, random, re, subprocess, sys, tempfile, time, urllib.parse, urllib.request
+"""validation-breaker / bounty-hunt — one iteration.
+Writes to the portal's bounty_hunt schema so the Vercel portal renders everything."""
+import json, os, random, re, subprocess, tempfile, time, urllib.parse, urllib.request
 import psycopg
 
 OPENROUTER_KEY = os.environ['OPENROUTER_API_KEY']
-NEON_URL       = os.environ['NEON_DATABASE_URL']
+DB_URL         = os.environ['NEON_DATABASE_URL']
 GH_TOKEN       = os.environ['GH_PAT']
-MODEL          = os.environ.get('VB_MODEL', 'google/gemma-4-31b-it:free')
+MODEL          = os.environ.get('VB_MODEL', 'google/gemma-4-31b-it')
 MAX_HITS       = int(os.environ.get('VB_MAX_HITS', '10000'))
 MAX_ANALYZE    = int(os.environ.get('VB_MAX_ANALYZE', '20'))
-TIME_BUDGET    = int(os.environ.get('VB_TIME_BUDGET', '840'))  # 14 min
+MAX_PATTERNS   = int(os.environ.get('VB_MAX_PATTERNS', '100'))
+TIME_BUDGET    = int(os.environ.get('VB_TIME_BUDGET', '840'))
 T0 = time.time()
+def over_budget(): return time.time() - T0 > TIME_BUDGET
 
-def over_budget():
-    return time.time() - T0 > TIME_BUDGET
-
-# ===== logging =====
-PROG = []
 def log(step, status, detail=''):
-    line = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {step} {status} {detail}"
-    PROG.append(line); print(line, flush=True)
+    print(f"{time.strftime('%H:%M:%S')} {step} {status} {detail}", flush=True)
 
-# ===== http =====
 def http(method, url, headers=None, body=None, timeout=60):
     data = json.dumps(body).encode() if isinstance(body, (dict,list)) else body
     req = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.read()
-    except urllib.error.HTTPError as e:
-        return e.code, e.read()
-    except Exception as e:
-        return 0, repr(e).encode()
+        with urllib.request.urlopen(req, timeout=timeout) as r: return r.status, r.read()
+    except urllib.error.HTTPError as e: return e.code, e.read()
+    except Exception as e: return 0, repr(e).encode()
 
 GH_HDR = {'Authorization': f'Bearer {GH_TOKEN}', 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'vb-bot'}
 OR_HDR = {'Authorization': f'Bearer {OPENROUTER_KEY}', 'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://github.com/dhyabi2/validation-breaker-state', 'X-Title': 'validation-breaker'}
+          'HTTP-Referer': 'https://bounty-hunt-portal.vercel.app', 'X-Title': 'validation-breaker'}
 
 # ===== db =====
-conn = psycopg.connect(NEON_URL, autocommit=True)
+conn = psycopg.connect(DB_URL, autocommit=True)
 cur = conn.cursor()
-cur.execute("""
-CREATE SCHEMA IF NOT EXISTS validation_breaker;
-CREATE TABLE IF NOT EXISTS validation_breaker.state (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS validation_breaker.patterns_tried (query TEXT PRIMARY KEY, lang TEXT, class TEXT, first_iter INT, uses INT DEFAULT 1, last_iter INT);
-CREATE TABLE IF NOT EXISTS validation_breaker.repos_scanned (repo TEXT, path TEXT, iter INT, flagged BOOL, PRIMARY KEY (repo, path));
-CREATE TABLE IF NOT EXISTS validation_breaker.findings (id SERIAL PRIMARY KEY, iter INT, repo TEXT, file_path TEXT, validator_line TEXT, attack_class TEXT, payload TEXT, verification_output TEXT, impact TEXT, bounty_program TEXT, bounty_url TEXT, confidence TEXT, reasoning TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
-CREATE TABLE IF NOT EXISTS validation_breaker.misses (id SERIAL PRIMARY KEY, iter INT, repo TEXT, file_path TEXT, attack_class TEXT, confidence TEXT, reason TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
-""")
 
-def state_get(k, default=None):
-    cur.execute("SELECT value FROM validation_breaker.state WHERE key=%s", (k,))
-    row = cur.fetchone()
-    return row[0] if row else default
+cur.execute("INSERT INTO bounty_hunt.runs(started_at, status, note) VALUES(NOW(), 'running', %s) RETURNING id",
+            (f"model={MODEL}",))
+run_id = cur.fetchone()[0]
+log('run', 'start', f'id={run_id} model={MODEL}')
 
-def state_set(k, v):
-    cur.execute("INSERT INTO validation_breaker.state(key,value) VALUES(%s,%s) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, str(v)))
-
-iter_n = int(state_get('iter_count', '0')) + 1
-state_set('iter_count', iter_n)
-log('start', 'ok', f'iter={iter_n} model={MODEL}')
-
-# ===== master pattern list (150+ patterns, 10 langs x many classes) =====
 MASTER = [
-    # python
-    ('python','ssrf-suffix','"urlparse" "hostname" ".endswith(" language:Python'),
-    ('python','ssrf-suffix2','"urlparse" ".hostname" "in ALLOWED" language:Python'),
-    ('python','ssrf-parser','"urlparse" "netloc" "requests.get" language:Python'),
-    ('python','ssrf-loopback','"127.0.0.1" "not in" "hostname" language:Python'),
-    ('python','path-traversal','"os.path.join" "request." "open(" language:Python'),
-    ('python','path-normalize','"os.path.normpath" "request" "open" language:Python'),
-    ('python','unanchored-regex','"re.search" "host" "requests" language:Python'),
-    ('python','unanchored-match','"re.match" "allowed" language:Python'),
-    ('python','prompt-injection','"re.search" "ignore previous" language:Python'),
-    ('python','prompt-filter','"any(" "word in" "prompt" language:Python'),
-    ('python','unicode-gap','".lower()" "not in" "blocked" language:Python'),
-    ('python','suffix-endswith','".endswith(" "hostname" "raise" language:Python'),
-    ('python','yaml-load','"yaml.load(" "Loader=yaml.Loader" language:Python'),
-    ('python','pickle-load','"pickle.loads" "request" language:Python'),
-    ('python','sqli-format','".format(" "SELECT" "cursor.execute" language:Python'),
-    # js
-    ('js','path-traversal','"path.join" "req.query" "sendFile" language:JavaScript'),
-    ('js','path-resolve','"path.resolve" "req.body" "readFile" language:JavaScript'),
-    ('js','ssrf-url','"new URL" ".hostname ===" language:JavaScript'),
-    ('js','ssrf-url-in','"new URL" ".hostname" "includes" language:JavaScript'),
-    ('js','prompt-injection','".match" "jailbreak" language:JavaScript'),
-    ('js','prompt-includes','".includes" "ignore" "instructions" language:JavaScript'),
-    ('js','unanchored-regex','"new RegExp" ".test(" "allowed" language:JavaScript'),
-    ('js','regex-host','"regex.test" "hostname" language:JavaScript'),
-    ('js','unicode-gap','".toLowerCase()" "includes" "host" language:JavaScript'),
-    ('js','deserialization','"JSON.parse" "req.body" "eval" language:JavaScript'),
-    ('js','node-vm','"new vm.Script" "req." language:JavaScript'),
-    ('js','child-exec','"child_process" "exec" "req.query" language:JavaScript'),
-    ('js','express-render','"res.render" "req.params" language:JavaScript'),
-    # ts
-    ('ts','path-traversal','"path.resolve" "req.params" "readFile" language:TypeScript'),
-    ('ts','ssrf-url','"new URL" "hostname" "fetch" language:TypeScript'),
-    ('ts','prompt-injection','"includes" "ignore" "instructions" language:TypeScript'),
-    ('ts','regex-hostname','"RegExp" "test" "hostname" language:TypeScript'),
-    ('ts','unicode-normalize','"normalize" "NFC" "compare" language:TypeScript'),
-    ('ts','class-transform','"class-transformer" "plainToInstance" language:TypeScript'),
-    ('ts','zod-parse','"z.string()" "url()" "fetch" language:TypeScript'),
-    ('ts','graphql-input','"InputType" "validate" "fetch" language:TypeScript'),
-    # go
-    ('go','ssrf-parser','"url.Parse" ".Host" "http.Get" language:Go'),
-    ('go','ssrf-host-eq','"url.Parse" "Host ==" "httpClient" language:Go'),
-    ('go','path-traversal','"filepath.Join" "r.URL.Query" language:Go'),
-    ('go','path-clean','"filepath.Clean" "r.FormValue" "os.Open" language:Go'),
-    ('go','unanchored-regex','"regexp.MatchString" "host" language:Go'),
-    ('go','regex-find','"regexp.MustCompile" "FindString" "host" language:Go'),
-    ('go','deserialization','"json.Unmarshal" "r.Body" language:Go'),
-    ('go','gob-decode','"gob.NewDecoder" "r.Body" language:Go'),
-    ('go','unicode-gap','"strings.ToLower" "==" "allowed" language:Go'),
-    ('go','prompt-injection','"strings.Contains" "prompt" "ignore" language:Go'),
-    ('go','sql-fmt','"fmt.Sprintf" "SELECT" "db.Exec" language:Go'),
-    # rust
-    ('rust','unanchored-regex','"Regex::new" "is_match" "reqwest" language:Rust'),
-    ('rust','regex-find','"Regex::new" ".find" "host" language:Rust'),
-    ('rust','ssrf-url','"Url::parse" ".host_str" language:Rust'),
-    ('rust','path-traversal','"Path::new" "query" "read_to_string" language:Rust'),
-    ('rust','deserialization','"serde_json::from_str" "body" language:Rust'),
-    ('rust','bincode','"bincode::deserialize" "body" language:Rust'),
-    ('rust','unicode-gap','".to_lowercase" "==" language:Rust'),
-    ('rust','prompt-inject','".contains" "system" "prompt" language:Rust'),
-    ('rust','sql-format','"format!" "SELECT" "sqlx" language:Rust'),
-    # java
-    ('java','deserialization','"ObjectInputStream" "readObject" language:Java'),
-    ('java','jackson-poly','"@JsonTypeInfo" "DefaultTyping" language:Java'),
-    ('java','ssrf-url','"new URL" ".getHost()" language:Java'),
-    ('java','path-traversal','"Paths.get" "getParameter" language:Java'),
-    ('java','file-traversal','"new File" "request.getParameter" language:Java'),
-    ('java','unanchored-regex','"Pattern.compile" ".matcher" "find()" language:Java'),
-    ('java','unicode-gap','".toLowerCase()" "equals" "allowed" language:Java'),
-    ('java','prompt-injection','".contains" "jailbreak" language:Java'),
-    ('java','spel-eval','"SpelExpressionParser" "parseExpression" language:Java'),
-    ('java','ognl','"Ognl.getValue" "request" language:Java'),
-    # ruby
-    ('ruby','ssrf-url','"URI.parse" ".host" "Net::HTTP" language:Ruby'),
-    ('ruby','open-uri','"open(" "params" "URI" language:Ruby'),
-    ('ruby','path-traversal','"File.join" "params" "File.read" language:Ruby'),
-    ('ruby','send-method','".send(" "params" language:Ruby'),
-    ('ruby','unanchored-regex','"=~" "host" "http.get" language:Ruby'),
-    ('ruby','deserialization','"Marshal.load" "params" language:Ruby'),
-    ('ruby','yaml-load','"YAML.load" "params" language:Ruby'),
-    ('ruby','unicode-gap','".downcase" "==" language:Ruby'),
-    # php
-    ('php','ssrf-parser','"parse_url" "host" "file_get_contents" language:PHP'),
-    ('php','curl-url','"parse_url" "CURLOPT_URL" language:PHP'),
-    ('php','path-traversal','"file_get_contents" "$_GET" language:PHP'),
-    ('php','include','"include(" "$_GET" language:PHP'),
-    ('php','unanchored-regex','"preg_match" "host" language:PHP'),
-    ('php','deserialization','"unserialize" "$_POST" language:PHP'),
-    ('php','phar','"phar://" "$_GET" language:PHP'),
-    ('php','unicode-gap','"strtolower" "==" "allowed" language:PHP'),
-    # csharp
-    ('csharp','ssrf-uri','"new Uri" ".Host" "HttpClient" language:C#'),
-    ('csharp','path-combine','"Path.Combine" "Request." language:C#'),
-    ('csharp','unanchored-regex','"Regex.IsMatch" "host" language:C#'),
-    ('csharp','deserialization','"BinaryFormatter" "Deserialize" language:C#'),
-    ('csharp','json-typeless','"JsonConvert" "TypeNameHandling" language:C#'),
-    ('csharp','unicode-gap','".ToLower()" "==" "Allowed" language:C#'),
-    ('csharp','razor-compile','"Razor.Parse" "request" language:C#'),
-    # kotlin / swift
-    ('kotlin','path-traversal','"File(" "request." "readText" language:Kotlin'),
-    ('kotlin','ssrf-url','"URL(" ".host" language:Kotlin'),
-    ('kotlin','unanchored-regex','"Regex(" ".containsMatchIn" language:Kotlin'),
-    ('kotlin','deserialization','"ObjectMapper" "readValue" language:Kotlin'),
-    ('swift','ssrf-url','"URL(string:" "host" language:Swift'),
-    ('swift','path-traversal','"FileManager" "contents" "request" language:Swift'),
+    ('python','ssrf-suffix','"urlparse" "hostname" ".endswith(" language:Python',3),
+    ('python','ssrf-suffix2','"urlparse" ".hostname" "in ALLOWED" language:Python',3),
+    ('python','ssrf-parser','"urlparse" "netloc" "requests.get" language:Python',3),
+    ('python','ssrf-loopback','"127.0.0.1" "not in" "hostname" language:Python',2),
+    ('python','path-traversal','"os.path.join" "request." "open(" language:Python',2),
+    ('python','path-normalize','"os.path.normpath" "request" "open" language:Python',3),
+    ('python','unanchored-regex','"re.search" "host" "requests" language:Python',3),
+    ('python','unanchored-match','"re.match" "allowed" language:Python',2),
+    ('python','prompt-injection','"re.search" "ignore previous" language:Python',2),
+    ('python','prompt-filter','"any(" "word in" "prompt" language:Python',2),
+    ('python','unicode-gap','".lower()" "not in" "blocked" language:Python',2),
+    ('python','suffix-endswith','".endswith(" "hostname" "raise" language:Python',3),
+    ('python','yaml-load','"yaml.load(" "Loader=yaml.Loader" language:Python',4),
+    ('python','pickle-load','"pickle.loads" "request" language:Python',4),
+    ('python','sqli-format','".format(" "SELECT" "cursor.execute" language:Python',3),
+    ('js','path-traversal','"path.join" "req.query" "sendFile" language:JavaScript',3),
+    ('js','path-resolve','"path.resolve" "req.body" "readFile" language:JavaScript',3),
+    ('js','ssrf-url','"new URL" ".hostname ===" language:JavaScript',3),
+    ('js','ssrf-url-in','"new URL" ".hostname" "includes" language:JavaScript',3),
+    ('js','prompt-injection','".match" "jailbreak" language:JavaScript',2),
+    ('js','prompt-includes','".includes" "ignore" "instructions" language:JavaScript',2),
+    ('js','unanchored-regex','"new RegExp" ".test(" "allowed" language:JavaScript',3),
+    ('js','regex-host','"regex.test" "hostname" language:JavaScript',3),
+    ('js','unicode-gap','".toLowerCase()" "includes" "host" language:JavaScript',2),
+    ('js','deserialization','"JSON.parse" "req.body" "eval" language:JavaScript',4),
+    ('js','node-vm','"new vm.Script" "req." language:JavaScript',4),
+    ('js','child-exec','"child_process" "exec" "req.query" language:JavaScript',4),
+    ('js','express-render','"res.render" "req.params" language:JavaScript',3),
+    ('ts','path-traversal','"path.resolve" "req.params" "readFile" language:TypeScript',3),
+    ('ts','ssrf-url','"new URL" "hostname" "fetch" language:TypeScript',3),
+    ('ts','prompt-injection','"includes" "ignore" "instructions" language:TypeScript',2),
+    ('ts','regex-hostname','"RegExp" "test" "hostname" language:TypeScript',3),
+    ('ts','unicode-normalize','"normalize" "NFC" "compare" language:TypeScript',2),
+    ('ts','class-transform','"class-transformer" "plainToInstance" language:TypeScript',3),
+    ('ts','zod-parse','"z.string()" "url()" "fetch" language:TypeScript',3),
+    ('ts','graphql-input','"InputType" "validate" "fetch" language:TypeScript',3),
+    ('go','ssrf-parser','"url.Parse" ".Host" "http.Get" language:Go',3),
+    ('go','ssrf-host-eq','"url.Parse" "Host ==" "httpClient" language:Go',3),
+    ('go','path-traversal','"filepath.Join" "r.URL.Query" language:Go',3),
+    ('go','path-clean','"filepath.Clean" "r.FormValue" "os.Open" language:Go',3),
+    ('go','unanchored-regex','"regexp.MatchString" "host" language:Go',3),
+    ('go','regex-find','"regexp.MustCompile" "FindString" "host" language:Go',3),
+    ('go','deserialization','"json.Unmarshal" "r.Body" language:Go',2),
+    ('go','gob-decode','"gob.NewDecoder" "r.Body" language:Go',4),
+    ('go','unicode-gap','"strings.ToLower" "==" "allowed" language:Go',2),
+    ('go','prompt-injection','"strings.Contains" "prompt" "ignore" language:Go',2),
+    ('go','sql-fmt','"fmt.Sprintf" "SELECT" "db.Exec" language:Go',3),
+    ('rust','unanchored-regex','"Regex::new" "is_match" "reqwest" language:Rust',3),
+    ('rust','regex-find','"Regex::new" ".find" "host" language:Rust',3),
+    ('rust','ssrf-url','"Url::parse" ".host_str" language:Rust',3),
+    ('rust','path-traversal','"Path::new" "query" "read_to_string" language:Rust',3),
+    ('rust','deserialization','"serde_json::from_str" "body" language:Rust',2),
+    ('rust','bincode','"bincode::deserialize" "body" language:Rust',3),
+    ('rust','unicode-gap','".to_lowercase" "==" language:Rust',2),
+    ('rust','prompt-inject','".contains" "system" "prompt" language:Rust',2),
+    ('rust','sql-format','"format!" "SELECT" "sqlx" language:Rust',3),
+    ('java','deserialization','"ObjectInputStream" "readObject" language:Java',4),
+    ('java','jackson-poly','"@JsonTypeInfo" "DefaultTyping" language:Java',4),
+    ('java','ssrf-url','"new URL" ".getHost()" language:Java',3),
+    ('java','path-traversal','"Paths.get" "getParameter" language:Java',3),
+    ('java','file-traversal','"new File" "request.getParameter" language:Java',3),
+    ('java','unanchored-regex','"Pattern.compile" ".matcher" "find()" language:Java',3),
+    ('java','unicode-gap','".toLowerCase()" "equals" "allowed" language:Java',2),
+    ('java','prompt-injection','".contains" "jailbreak" language:Java',2),
+    ('java','spel-eval','"SpelExpressionParser" "parseExpression" language:Java',4),
+    ('java','ognl','"Ognl.getValue" "request" language:Java',4),
+    ('ruby','ssrf-url','"URI.parse" ".host" "Net::HTTP" language:Ruby',3),
+    ('ruby','open-uri','"open(" "params" "URI" language:Ruby',4),
+    ('ruby','path-traversal','"File.join" "params" "File.read" language:Ruby',3),
+    ('ruby','send-method','".send(" "params" language:Ruby',4),
+    ('ruby','unanchored-regex','"=~" "host" "http.get" language:Ruby',3),
+    ('ruby','deserialization','"Marshal.load" "params" language:Ruby',4),
+    ('ruby','yaml-load','"YAML.load" "params" language:Ruby',4),
+    ('ruby','unicode-gap','".downcase" "==" language:Ruby',2),
+    ('php','ssrf-parser','"parse_url" "host" "file_get_contents" language:PHP',3),
+    ('php','curl-url','"parse_url" "CURLOPT_URL" language:PHP',3),
+    ('php','path-traversal','"file_get_contents" "$_GET" language:PHP',3),
+    ('php','include','"include(" "$_GET" language:PHP',4),
+    ('php','unanchored-regex','"preg_match" "host" language:PHP',3),
+    ('php','deserialization','"unserialize" "$_POST" language:PHP',4),
+    ('php','phar','"phar://" "$_GET" language:PHP',4),
+    ('php','unicode-gap','"strtolower" "==" "allowed" language:PHP',2),
+    ('csharp','ssrf-uri','"new Uri" ".Host" "HttpClient" language:C#',3),
+    ('csharp','path-combine','"Path.Combine" "Request." language:C#',3),
+    ('csharp','unanchored-regex','"Regex.IsMatch" "host" language:C#',3),
+    ('csharp','deserialization','"BinaryFormatter" "Deserialize" language:C#',4),
+    ('csharp','json-typeless','"JsonConvert" "TypeNameHandling" language:C#',4),
+    ('csharp','unicode-gap','".ToLower()" "==" "Allowed" language:C#',2),
+    ('csharp','razor-compile','"Razor.Parse" "request" language:C#',4),
+    ('kotlin','path-traversal','"File(" "request." "readText" language:Kotlin',3),
+    ('kotlin','ssrf-url','"URL(" ".host" language:Kotlin',3),
+    ('kotlin','unanchored-regex','"Regex(" ".containsMatchIn" language:Kotlin',3),
+    ('kotlin','deserialization','"ObjectMapper" "readValue" language:Kotlin',2),
+    ('swift','ssrf-url','"URL(string:" "host" language:Swift',3),
+    ('swift','path-traversal','"FileManager" "contents" "request" language:Swift',3),
+    # added to reach 100+
+    ('python','xml-external','"etree" "parse" "request" language:Python',4),
+    ('python','template-injection','"Template" "render" "request" language:Python',4),
+    ('python','command-inj','"subprocess" "shell=True" "request" language:Python',4),
+    ('js','open-redirect','"res.redirect" "req.query" language:JavaScript',2),
+    ('js','eval-user','"eval(" "req." language:JavaScript',5),
+    ('go','cmd-exec','"exec.Command" "r.FormValue" language:Go',4),
+    ('rust','cmd-exec','"Command::new" "body" language:Rust',4),
+    ('java','xxe','"DocumentBuilderFactory" "parse" "request" language:Java',4),
+    ('php','lfi','"readfile" "$_GET" language:PHP',4),
+    ('csharp','xxe','"XmlDocument" "Load" "Request" language:C#',4),
 ]
 
-# ===== pick patterns =====
-cur.execute("SELECT query FROM validation_breaker.patterns_tried")
+cur.execute("SELECT DISTINCT query FROM bounty_hunt.patterns")
 tried = {r[0] for r in cur.fetchall()}
 unused = [p for p in MASTER if p[2] not in tried]
-random.seed(int(time.time()) ^ iter_n)
-picked = random.sample(unused, min(100, len(unused))) if unused else random.sample(MASTER, min(100, len(MASTER)))
+random.seed(int(time.time()) ^ run_id)
+picked = random.sample(unused, min(MAX_PATTERNS, len(unused))) if unused else random.sample(MASTER, min(MAX_PATTERNS, len(MASTER)))
 log('patterns', 'ok', f'master={len(MASTER)} tried={len(tried)} picked={len(picked)}')
 
-# ===== search =====
-all_hits = []  # {repo, path, sha, score, pattern, class}
-for idx, (lang, cls, q) in enumerate(picked):
+for (lang, cls, query, sev) in picked:
+    pid = f"{lang}:{cls}"
+    cur.execute("INSERT INTO bounty_hunt.patterns(run_id, pattern_id, query, language, sev) VALUES(%s,%s,%s,%s,%s)",
+                (run_id, pid, query, lang, sev))
+
+all_hits = []
+for idx, (lang, cls, query, sev) in enumerate(picked):
     if over_budget() or len(all_hits) >= MAX_HITS:
-        log('search', 'stop', f'idx={idx} hits={len(all_hits)} reason={"budget" if over_budget() else "cap"}')
+        log('search', 'stop', f'idx={idx} hits={len(all_hits)}')
         break
-    url = 'https://api.github.com/search/code?' + urllib.parse.urlencode({'q': q, 'per_page': 100})
+    url = 'https://api.github.com/search/code?' + urllib.parse.urlencode({'q': query, 'per_page': 100})
     code, body = http('GET', url, headers=GH_HDR)
     if code == 200:
         d = json.loads(body)
-        for i in d.get('items', []):
+        items = d.get('items', [])
+        pid = f"{lang}:{cls}"
+        for i in items:
+            hit_url = i.get('html_url') or f"https://github.com/{i['repository']['full_name']}/blob/{i['sha']}/{i['path']}"
+            cur.execute("INSERT INTO bounty_hunt.hits(run_id, pattern_id, repo, path, url, ingested_at) VALUES(%s,%s,%s,%s,%s,NOW()) RETURNING id",
+                        (run_id, pid, i['repository']['full_name'], i['path'], hit_url))
+            hit_id = cur.fetchone()[0]
             all_hits.append({
-                'repo': i['repository']['full_name'], 'path': i['path'], 'sha': i['sha'],
-                'score': i.get('score', 0), 'lang': lang, 'class': cls, 'query': q,
+                'id': hit_id, 'repo': i['repository']['full_name'], 'path': i['path'], 'sha': i['sha'],
+                'url': hit_url, 'score': float(i.get('score', 0) or 0), 'lang': lang, 'class': cls, 'sev': sev, 'pattern_id': pid,
             })
     elif code == 403:
-        # rate limited — back off
-        log('search', 'rate-limit', f'idx={idx} sleeping 30s')
-        time.sleep(30)
+        log('search', 'rate-limit', 'sleep 30s'); time.sleep(30)
     else:
-        log('search', 'fail', f'code={code} q={q[:40]}')
-    # mark pattern tried
-    cur.execute("""INSERT INTO validation_breaker.patterns_tried(query,lang,class,first_iter,last_iter)
-                   VALUES(%s,%s,%s,%s,%s) ON CONFLICT (query) DO UPDATE SET uses=patterns_tried.uses+1, last_iter=EXCLUDED.last_iter""",
-                (q, lang, cls, iter_n, iter_n))
-    time.sleep(2.2)  # 27 req/min
+        log('search', 'fail', f'code={code}')
+    time.sleep(2.2)
 
-log('search', 'done', f'hits={len(all_hits)} patterns_used={min(idx+1,len(picked))}')
+log('search', 'done', f'hits={len(all_hits)}')
 
-# ===== dedup repos against prior iterations =====
-cur.execute("SELECT repo FROM validation_breaker.repos_scanned")
-scanned = {r[0] for r in cur.fetchall()}
-fresh = [h for h in all_hits if h['repo'] not in scanned]
-log('dedup', 'ok', f'fresh={len(fresh)} repeats={len(all_hits)-len(fresh)}')
-
-# ===== bounty filter =====
-def fetch_huntr():
-    # huntr does not have a public eligible-repo list; they publish disclosed bounties as blog posts.
-    # Heuristic: any repo that has had a huntr disclosure is eligible. We fetch the disclosed feed.
+def fetch_huntr_repos():
     code, body = http('GET', 'https://huntr.com/api/v2/bounties?status=disclosed&limit=500',
                       headers={'User-Agent': 'vb-bot', 'Accept': 'application/json'})
     repos = set()
@@ -232,162 +201,200 @@ def fetch_huntr():
         except: pass
     return repos
 
-def fetch_h1():
-    # HackerOne scraping is gnarly; instead use their GraphQL public directory if available,
-    # or fall back to a static known-good list of OSS-scoped programs.
-    known = {
-        'airbnb/airbnb', 'airbnb/lottie-ios', 'discourse/discourse', 'docker/docker-ce',
-        'gitlab-org/gitlab', 'mozilla/gecko-dev', 'nextcloud/server', 'nodejs/node',
-        'opencart/opencart', 'phpmyadmin/phpmyadmin', 'shopify/liquid', 'shopify/shopify-api-ruby',
-        'spotify/docker-client', 'uber/RIBs', 'wordpress/wordpress', 'yelp/synapse',
-        'facebook/hermes', 'facebook/react', 'facebook/react-native', 'curl/curl',
-    }
-    return {r.lower() for r in known}
+H1_KNOWN_ORGS = {
+    # well-known HackerOne programs with active GitHub scope (orgs; any repo under them is in scope)
+    'airbnb','discourse','gitlab-org','mozilla','nextcloud','nodejs','phpmyadmin','shopify',
+    'wordpress','facebook','meta-llama','facebookresearch','curl','uber','uber-go','spotify',
+    'square','hackerone','getsentry','twilio','auth0','magento','grab','gitterhq','dropbox',
+    'slackhq','yelp','zomato','bookingcom','mapbox','twitter','docker','kubernetes','cloudflare',
+    'torproject','cisco','ibm','adobe','snapcore','snapchat','line','linecorp','basecamp',
+    'gitlab','github','heroku','pinterest','paypal','ebay','lyft','verizonmedia','yahoo',
+    'indeed-com','semrush','rockstargames','grammarly','zendesk','atlassian','bugcrowd',
+    'asana','figma','intel','intercom','netflix','tesla','tinder','vimeo','xero','zapier',
+    'zoomus','zoom','okta','salesforce','digitalocean','backblaze','plaid','stripe',
+    'hashicorp','elastic','gitea','forgejo',
+}
+H1_KNOWN = set()  # full repo names override — kept for backward compat
+AI_ORGS = {'huggingface','langchain-ai','openai','anthropic','google','meta-llama','nvidia','microsoft','ibm',
+           'vllm-project','ray-project','mlflow','bentoml','triton-inference-server','gradio-app','streamlit',
+           'kubeflow','feast-dev','mosaicml','bigscience','eleutherai','facebookresearch','pytorch','tensorflow',
+           'onnx','ml-explore','unslothai','vllm','mlc-ai','ollama','guardrails-ai','llamaindex','pydantic',
+           'langgraph','crewaiinc','giskard-ai','promptfoo','haystackai','comfyanonymous','automatic1111',
+           'invoke-ai','scikit-learn','allenai','stability-ai','runwayml','vercel','nextauthjs'}
 
-huntr_repos = fetch_huntr()
-h1_repos = fetch_h1()
-eligible_set = huntr_repos | h1_repos
-log('bounty', 'ok', f'huntr={len(huntr_repos)} h1={len(h1_repos)} union={len(eligible_set)}')
-
+huntr_repos = fetch_huntr_repos()
 def why_eligible(repo):
     r = repo.lower()
-    if r in huntr_repos: return 'huntr', f'https://huntr.com/repos/{r}'
-    if r in h1_repos:    return 'hackerone', f'https://hackerone.com/{r.split("/")[0]}'
-    # accept AI/ML repos heuristically (huntr covers AI/ML broadly) if they match known AI org names
-    ai_orgs = {'huggingface', 'langchain-ai', 'openai', 'anthropic', 'google', 'meta-llama',
-               'nvidia', 'openlm-research', 'lm-sys', 'microsoft', 'ibm',
-               'vllm-project', 'ray-project', 'mlflow', 'bentoml', 'triton-inference-server',
-               'gradio-app', 'streamlit', 'intel', 'kubeflow', 'feast-dev', 'mosaicml',
-               'bigscience', 'eleutherai', 'facebookresearch', 'pytorch', 'tensorflow',
-               'onnx', 'ml-explore', 'unslothai', 'vllm', 'mlc-ai', 'ollama', 'lm-studio',
-               'guardrails-ai', 'llamaindex', 'pydantic', 'langgraph', 'crewaiinc',
-               'transformerlab', 'giskard-ai', 'promptfoo', 'haystackai',
-               'comfyanonymous', 'automatic1111', 'invoke-ai', 'lllyasviel',
-               'scikit-learn', 'pandas-dev', 'numpy', 'scipy', 'jupyter',
-               'open-mmlab', 'ultralytics', 'paddlepaddle', 'pjlab-adg',
-               'allenai', 'salesforceresearch', 'stability-ai', 'runwayml',
-               'vercel', 'nextauthjs'}
-    if r.split('/')[0] in ai_orgs: return 'huntr-ai-heuristic', 'https://huntr.com/'
-    return None, None
+    org = r.split('/')[0]
+    if r in huntr_repos: return ('huntr', f'https://huntr.com/repos/{r}', 3, 1)
+    if r in H1_KNOWN or org in H1_KNOWN_ORGS: return ('hackerone', f'https://hackerone.com/{org}', 2, 0)
+    if org in AI_ORGS: return ('huntr-ai', 'https://huntr.com/', 2, 2)
+    return (None, None, 0, 0)
 
 eligible = []
-for h in fresh:
-    program, url = why_eligible(h['repo'])
-    if program:
-        h['bounty_program'] = program; h['bounty_url'] = url
+for h in all_hits:
+    prog, url, tier, ai_bonus = why_eligible(h['repo'])
+    if prog:
+        h['program'], h['program_url'], h['tier'], h['ai_bonus'] = prog, url, tier, ai_bonus
         eligible.append(h)
-log('filter', 'ok', f'eligible={len(eligible)}')
+log('filter', 'ok', f'huntr={len(huntr_repos)} eligible={len(eligible)}')
 
-# ===== analyze top targets until verified or out of time =====
-eligible.sort(key=lambda h: h['score'], reverse=True)
-verified_count = 0
-analyzed_count = 0
+eligible.sort(key=lambda h: (h['tier'], h['score'], h['ai_bonus']), reverse=True)
+targets = []
+for rank, h in enumerate(eligible[:MAX_ANALYZE], start=1):
+    cur.execute("""INSERT INTO bounty_hunt.targets(run_id, hit_id, rank, score, tier, ai_bonus, sev, stars, pattern_id, repo, path, url, status)
+                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending') RETURNING id""",
+                (run_id, h['id'], rank, h['score'], h['tier'], h['ai_bonus'], h['sev'], 0, h['pattern_id'],
+                 h['repo'], h['path'], h['url']))
+    tid = cur.fetchone()[0]
+    h['target_id'] = tid
+    targets.append(h)
+log('targets', 'ok', f'created={len(targets)}')
 
-SYSTEM_PROMPT = """You are a security researcher analyzing open-source code for validation bypasses.
+SYSTEM_PROMPT = """You are a security researcher analyzing an open-source validator for bypass bugs.
 
-You know these bug classes cold:
-- URL parser vs validator differential (urlparse vs requests, new URL vs fetch, url.Parse vs net/http). Payloads: userinfo (http://evil.com#@internal/), backslash (http://evil.com\\@internal/), IPv6 zone id, decimal/hex IP.
-- Unanchored regex (re.search vs re.fullmatch, Regex.IsMatch without ^$)
+MISSION: Find code where external input flows into a security validator that is trivially bypassable (parser/validator mismatch, unanchored regex, suffix match without anchor, case/Unicode gap, path join before normalize, deserialization gate, unescaped prompt filter....many other). You mission is to break this security piece of code with maximum focus , find related dependencies that could mitigate have security measurement and have full knwoledge how to break it.
+
+Classic parser/validator mismatches to check:
+- URL parser differential (urlparse vs requests, new URL vs fetch, url.Parse vs net/http) — payloads: http://evil.com#@internal/, http://evil.com\\@internal/, IPv6 zone, decimal/hex IP, trailing-dot host
+- Unanchored regex (re.search vs re.fullmatch; Regex.IsMatch without ^$; preg_match without \\A\\z)
 - Suffix match without dot prefix (.endswith('.evil.com') accepting 'attacker-evil.com')
-- Case/Unicode normalization gap (ToLower but no NFKC, Turkish I, fullwidth chars)
-- Path join before normalize (path.join then readFile without resolving up-levels)
-- Deserialization gates (pickle, unserialize, yaml.Loader, readObject with user input)
-- Prompt-injection filter that uses substring/regex without handling homoglyphs, base64, tool-chained injections
+- Case/Unicode gap (.lower() + == missing Turkish I, fullwidth, NFKC)
+- Path join before normalize (path.join → readFile without resolve+startswith)
+- Deserialization gates (pickle/yaml.Loader/readObject/unserialize on user input)
+- Prompt-injection filter using substring/regex missing homoglyphs, base64, tool-chained injections
 
-Respond as STRICT JSON with exactly these fields:
+Respond STRICT JSON with these exact fields:
 {
-  "exploitable": true|false,
-  "class": "one-word",
-  "validator_line": "exact line from source, or null",
-  "payload": "concrete payload string, or null",
-  "verification_python": "self-contained python3 stdlib-only snippet that prints the string 'VB_BYPASS_VERIFIED' to stdout IFF the payload demonstrates the bypass. Must not make network calls. Should implement the VALIDATOR ONLY (mimic it exactly) and show the mismatch. Or null.",
-  "expected_marker": "VB_BYPASS_VERIFIED",
-  "impact": "RCE|SSRF-to-metadata|auth-bypass|path-traversal|prompt-injection|deserialization-rce|other",
-  "confidence": "high|medium|low",
-  "reasoning": "2-4 sentence technical explanation"
+ "exploitable": true|false,
+ "class": "one-word",
+ "title": "short bypass title",
+ "line_range": "Lx-Ly or null",
+ "vulnerable_code": "10-20 lines of the relevant code block",
+ "input_source": "where the external input enters (e.g. 'req.query.path')",
+ "validation": "exact validator expression",
+ "sink": "what resolves the input (e.g. 'requests.get', 'open', 'exec')",
+ "reachability": "how request reaches the sink (1-2 sentences)",
+ "bypass_payload": "concrete payload, or null",
+ "verification_python": "self-contained stdlib-only python3 snippet that prints 'VB_BYPASS_VERIFIED' IFF the payload demonstrates the bypass. No network. Null if cannot write one.",
+ "expected_marker": "VB_BYPASS_VERIFIED",
+ "impact": "RCE|SSRF-to-metadata|auth-bypass|path-traversal|prompt-injection|deserialization-rce|other",
+ "severity": "critical|high|medium|low",
+ "confidence": "high|medium|low",
+ "explanation": "2-4 sentence technical explanation",
+ "suggested_fix": "1-2 sentences",
+ "markdown": "full finding writeup suitable for a disclosure report"
 }
 
-Rules: If you cannot find a concrete bypass, set exploitable=false and set payload/verification_python/validator_line to null. NEVER invent a payload you cannot verify. The verification snippet must ACTUALLY demonstrate the bypass when run."""
+No fabrication. If no exploitable gap, set exploitable=false and null the payload/verification fields."""
 
-for target in eligible[:MAX_ANALYZE]:
-    if over_budget(): break
-    analyzed_count += 1
-    # fetch source
-    raw_url = f'https://raw.githubusercontent.com/{target["repo"]}/{target["sha"]}/{target["path"]}'
-    code, body = http('GET', raw_url, headers=GH_HDR)
-    if code != 200:
-        log('fetch', 'fail', f'{target["repo"]}:{target["path"]} code={code}')
-        continue
-    src = body.decode('utf-8', errors='replace')
-    if len(src) > 40000: src = src[:40000]  # truncate giant files
-    # call gemma
-    prompt_user = f"File: {target['repo']}::{target['path']}\nBounty: {target['bounty_program']}\nPattern class: {target['class']}\n\n```\n{src}\n```\n\nFind the bypass."
-    or_body = {
-        'model': MODEL,
-        'messages': [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': prompt_user}],
-        'temperature': 0.2, 'max_tokens': 2000,
-        'response_format': {'type': 'json_object'},
-    }
-    code, body = http('POST', 'https://openrouter.ai/api/v1/chat/completions', headers=OR_HDR, body=or_body, timeout=180)
-    if code != 200:
-        log('llm', 'fail', f'code={code} body={body[:200]!r}')
-        continue
+def hermes_deep_analyze(src, repo, path, prior_attempt):
+    """Invoke Hermes CLI for a smarter second opinion. Returns parsed JSON or None."""
+    prompt = (f"You are a senior security researcher. A previous fast analysis was inconclusive:\n"
+              f"prior: {json.dumps(prior_attempt)[:1500]}\n\n"
+              f"Re-analyze this validator carefully. Find a REAL verifiable bypass.\n"
+              f"File: {repo}::{path}\n\n```\n{src[:20000]}\n```\n\n"
+              f"Return STRICT JSON with fields exploitable, class, title, line_range, vulnerable_code, "
+              f"input_source, validation, sink, reachability, bypass_payload, verification_python, "
+              f"expected_marker, impact, severity, confidence, explanation, suggested_fix, markdown. "
+              f"verification_python must print 'VB_BYPASS_VERIFIED' to stdout iff the payload works. "
+              f"No fabrication — if there is no real bypass, set exploitable=false.")
     try:
-        resp = json.loads(body)
-        content = resp['choices'][0]['message']['content']
-        # strip code fences if present
-        content = re.sub(r'^```(?:json)?\s*|\s*```$', '', content.strip(), flags=re.MULTILINE)
-        analysis = json.loads(content)
+        r = subprocess.run(
+            ['python', '/hermes/cli.py', '--query', prompt, '--quiet'],
+            capture_output=True, text=True, timeout=180,
+            env={**os.environ, 'HOME': '/root'}
+        )
+        out = (r.stdout or '') + (r.stderr or '')
+        m = re.search(r'\{[\s\S]*\}', out)
+        if m:
+            return json.loads(m.group(0))
     except Exception as e:
-        log('llm-parse', 'fail', f'{target["repo"]} err={e}')
-        continue
+        log('hermes', 'fail', repr(e)[:100])
+    return None
 
-    cur.execute("INSERT INTO validation_breaker.repos_scanned(repo,path,iter,flagged) VALUES(%s,%s,%s,%s) ON CONFLICT DO NOTHING",
-                (target['repo'], target['path'], iter_n, bool(analysis.get('exploitable'))))
-
-    if not analysis.get('exploitable') or not analysis.get('verification_python'):
-        cur.execute("INSERT INTO validation_breaker.misses(iter,repo,file_path,attack_class,confidence,reason) VALUES(%s,%s,%s,%s,%s,%s)",
-                    (iter_n, target['repo'], target['path'], analysis.get('class'), analysis.get('confidence'), (analysis.get('reasoning') or '')[:2000]))
-        log('miss', 'ok', f'{target["repo"]} {analysis.get("class")} {analysis.get("confidence")}')
-        continue
-
-    # verify
-    marker = analysis.get('expected_marker') or 'VB_BYPASS_VERIFIED'
+def verify_poc(verification_python, expected_marker='VB_BYPASS_VERIFIED'):
+    if not verification_python: return False, 'no snippet'
     with tempfile.NamedTemporaryFile('w', suffix='.py', delete=False) as f:
-        f.write(analysis['verification_python']); script = f.name
+        f.write(verification_python); script = f.name
     try:
         r = subprocess.run(['python3', script], capture_output=True, text=True, timeout=30)
         out = (r.stdout or '') + '\n--STDERR--\n' + (r.stderr or '')
-        verified = marker in r.stdout
+        return (expected_marker in (r.stdout or '')), out
     except Exception as e:
-        out = f'exec error: {e}'; verified = False
+        return False, f'exec error: {e}'
     finally:
         try: os.unlink(script)
         except: pass
 
-    if verified:
-        verified_count += 1
-        cur.execute("""INSERT INTO validation_breaker.findings
-            (iter,repo,file_path,validator_line,attack_class,payload,verification_output,impact,bounty_program,bounty_url,confidence,reasoning)
-            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (iter_n, target['repo'], target['path'], analysis.get('validator_line'), analysis.get('class'),
-             analysis.get('payload'), out[:8000], analysis.get('impact'), target['bounty_program'], target['bounty_url'],
-             analysis.get('confidence'), analysis.get('reasoning')))
-        log('FINDING', 'verified', f'{target["repo"]}:{target["path"]} {analysis.get("class")} {analysis.get("impact")}')
-    else:
-        cur.execute("INSERT INTO validation_breaker.misses(iter,repo,file_path,attack_class,confidence,reason) VALUES(%s,%s,%s,%s,%s,%s)",
-                    (iter_n, target['repo'], target['path'], analysis.get('class'), analysis.get('confidence'),
-                     f"verification failed. {(analysis.get('reasoning') or '')[:1500]}"))
-        log('unverified', 'ok', f'{target["repo"]} {analysis.get("class")}')
+analyzed = 0; verified = 0; hermes_retries = 0; MAX_HERMES_RETRIES = 3
+for target in targets:
+    if over_budget(): break
+    analyzed += 1
+    raw_url = f'https://raw.githubusercontent.com/{target["repo"]}/{target["sha"]}/{target["path"]}'
+    code, body = http('GET', raw_url, headers=GH_HDR)
+    if code != 200:
+        cur.execute("UPDATE bounty_hunt.targets SET status='fetch_failed' WHERE id=%s", (target['target_id'],))
+        continue
+    src = body.decode('utf-8', errors='replace')[:40000]
+    user_msg = f"File: {target['repo']}::{target['path']}\nBounty: {target['program']}\nPattern: {target['pattern_id']}\n\n```\n{src}\n```\n\nFind the bypass."
+    or_body = {'model': MODEL, 'messages': [{'role':'system','content':SYSTEM_PROMPT},{'role':'user','content':user_msg}],
+               'temperature': 0.2, 'max_tokens': 2500, 'response_format': {'type':'json_object'}}
+    code, body = http('POST', 'https://openrouter.ai/api/v1/chat/completions', headers=OR_HDR, body=or_body, timeout=180)
+    if code != 200:
+        cur.execute("UPDATE bounty_hunt.targets SET status='llm_failed' WHERE id=%s", (target['target_id'],))
+        log('llm', 'fail', f'code={code}')
+        continue
+    try:
+        resp = json.loads(body)
+        content = resp['choices'][0]['message']['content']
+        content = re.sub(r'^```(?:json)?\s*|\s*```$', '', content.strip(), flags=re.MULTILINE)
+        a = json.loads(content)
+    except Exception:
+        cur.execute("UPDATE bounty_hunt.targets SET status='parse_failed' WHERE id=%s", (target['target_id'],))
+        continue
 
-# ===== summary =====
-log('done', 'ok', f'iter={iter_n} hits={len(all_hits)} fresh={len(fresh)} eligible={len(eligible)} analyzed={analyzed_count} verified={verified_count}')
+    needs_retry = not a.get('exploitable') or not a.get('verification_python') or not a.get('bypass_payload')
+    ok = False; out = ''
+    if not needs_retry:
+        ok, out = verify_poc(a.get('verification_python'), a.get('expected_marker') or 'VB_BYPASS_VERIFIED')
 
-# persist progress log to repo file
-with open('progress.log', 'a') as f:
-    f.write('\n'.join(PROG) + '\n\n')
-with open('LATEST.md', 'w') as f:
-    f.write(f"# Iter {iter_n}\n\n- Hits: {len(all_hits)}\n- Fresh: {len(fresh)}\n- Eligible: {len(eligible)}\n- Analyzed: {analyzed_count}\n- Verified: {verified_count}\n\nSee Neon: `SELECT * FROM validation_breaker.findings ORDER BY id DESC;`\n")
+    # Hermes retry path: if Gemma said not-exploitable OR its PoC failed to verify,
+    # invoke Hermes CLI for a deeper second opinion (up to 3 retries per iter).
+    if (needs_retry or not ok) and hermes_retries < MAX_HERMES_RETRIES:
+        hermes_retries += 1
+        log('hermes', 'retry', f'{target["repo"]} attempt={hermes_retries}')
+        h = hermes_deep_analyze(src, target['repo'], target['path'], a)
+        if h and h.get('exploitable') and h.get('verification_python') and h.get('bypass_payload'):
+            h_ok, h_out = verify_poc(h.get('verification_python'), h.get('expected_marker') or 'VB_BYPASS_VERIFIED')
+            if h_ok:
+                a = h; ok = True; out = h_out
+                log('hermes', 'bypass', f'{target["repo"]} hermes found what gemma missed')
 
+    if not ok:
+        cur.execute("UPDATE bounty_hunt.targets SET status=%s WHERE id=%s",
+                    ('no_bypass' if needs_retry else 'verify_failed', target['target_id']))
+        continue
+
+    if True:  # verified
+        verified += 1
+        cur.execute("""INSERT INTO bounty_hunt.findings
+            (run_id, target_id, created_at, repo, path, line_range, title, bug_class, severity, status,
+             vulnerable_code, input_source, validation, sink, reachability,
+             bypass_payload, explanation, impact, poc, suggested_fix,
+             disclosure_venue, report_url, markdown)
+            VALUES(%s,%s,NOW(),%s,%s,%s,%s,%s,%s,'confirmed',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (run_id, target['target_id'], target['repo'], target['path'], a.get('line_range'),
+             a.get('title') or f"{a.get('class','bypass')} in {target['repo']}",
+             a.get('class'), a.get('severity'),
+             a.get('vulnerable_code'), a.get('input_source'), a.get('validation'), a.get('sink'), a.get('reachability'),
+             a.get('bypass_payload') or '', a.get('explanation'), a.get('impact'),
+             out[:8000], a.get('suggested_fix'),
+             target['program'], target['program_url'], a.get('markdown')))
+        cur.execute("UPDATE bounty_hunt.targets SET status='bypass_found' WHERE id=%s", (target['target_id'],))
+        log('FINDING', 'verified', f'{target["repo"]}:{target["path"]} {a.get("class")}')
+
+cur.execute("UPDATE bounty_hunt.runs SET finished_at=NOW(), status='succeeded', note=%s WHERE id=%s",
+            (f"hits={len(all_hits)} eligible={len(eligible)} analyzed={analyzed} verified={verified} hermes_retries={hermes_retries}", run_id))
 cur.close(); conn.close()
-print(f"\n=== iter {iter_n}: {len(all_hits)} hits, {len(eligible)} eligible, {analyzed_count} analyzed, {verified_count} verified ===")
+print(f"\niter run_id={run_id}: {len(all_hits)} hits, {len(eligible)} eligible, {analyzed} analyzed, {verified} verified")
