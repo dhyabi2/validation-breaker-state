@@ -385,13 +385,16 @@ for target in targets:
     if over_budget(): break
     analyzed += 1
     _current_target_id = target['target_id']
-    debug('target_start', body={'target_id': target['target_id'], 'repo': target['repo'], 'path': target['path'], 'pattern': target['pattern_id'], 'rank': eligible.index(target)+1 if target in eligible else None})
+    cur.execute("UPDATE bounty_hunt.targets SET status='fetching', started_at=NOW() WHERE id=%s", (target['target_id'],))
+    debug('target_start', body={'target_id': target['target_id'], 'repo': target['repo'], 'path': target['path'], 'pattern': target['pattern_id']})
     raw_url = f'https://raw.githubusercontent.com/{target["repo"]}/{target["sha"]}/{target["path"]}'
     code, body = http('GET', raw_url, headers=GH_HDR)
     if code != 200:
         cur.execute("UPDATE bounty_hunt.targets SET status='fetch_failed' WHERE id=%s", (target['target_id'],))
         continue
     src = body.decode('utf-8', errors='replace')[:40000]
+    cur.execute("UPDATE bounty_hunt.targets SET status='analyzing', source_preview=%s WHERE id=%s",
+                (src[:8000], target['target_id']))
     user_msg = f"File: {target['repo']}::{target['path']}\nBounty: {target['program']}\nPattern: {target['pattern_id']}\n\n```\n{src}\n```\n\nFind the bypass."
     or_body = {'model': MODEL, 'messages': [{'role':'system','content':SYSTEM_PROMPT},{'role':'user','content':user_msg}],
                'temperature': 0.2, 'max_tokens': 2500, 'response_format': {'type':'json_object'}}
@@ -406,6 +409,7 @@ for target in targets:
         content = re.sub(r'^```(?:json)?\s*|\s*```$', '', content.strip(), flags=re.MULTILINE)
         a = json.loads(content)
         debug('llm_parsed', body={'exploitable': a.get('exploitable'), 'class': a.get('class'), 'confidence': a.get('confidence'), 'title': a.get('title'), 'has_payload': bool(a.get('bypass_payload')), 'has_verification': bool(a.get('verification_python'))})
+        cur.execute("UPDATE bounty_hunt.targets SET analyzed_at=NOW() WHERE id=%s", (target['target_id'],))
     except Exception as e:
         debug('llm_parse_fail', body=repr(e) + ' :: raw=' + (content[:1000] if 'content' in dir() else '?'))
         cur.execute("UPDATE bounty_hunt.targets SET status='parse_failed' WHERE id=%s", (target['target_id'],))
