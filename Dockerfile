@@ -11,5 +11,5 @@ RUN mkdir -p /root/.hermes/skills/security/validation-breaker
 COPY skills/validation-breaker/SKILL.md /root/.hermes/skills/security/validation-breaker/SKILL.md
 COPY scripts/iterate.py /iterate.py
 
-# Entrypoint: one iteration, then exit
-CMD ["bash", "-c", "python /iterate.py"]
+# Entrypoint: hourly loop (stays alive as a DO App Platform Worker)
+CMD ["bash", "-c", "while true; do echo \"[$(date -u +%FT%TZ)] iter start\"; python /iterate.py || echo \"[$(date -u +%FT%TZ)] iter failed $?\"; echo \"[$(date -u +%FT%TZ)] sleeping 3600s\"; sleep 3600; done"]
