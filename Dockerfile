@@ -14,9 +14,10 @@ RUN pip install --no-cache-dir --break-system-packages -e /hermes 'psycopg[binar
 # Bootstrap.py looks for hermes-agent at $HERMES_HOME/hermes-agent — symlink it
 RUN mkdir -p /root/.hermes && ln -sf /hermes /root/.hermes/hermes-agent
 
-# Seed the validation-breaker skill + iter script
-RUN mkdir -p /seed-skills/security/validation-breaker
+# Seed skills: validation-breaker + hermes-feedback + iter script
+RUN mkdir -p /seed-skills/security/validation-breaker /seed-skills/portal/hermes-feedback
 COPY skills/validation-breaker/SKILL.md /seed-skills/security/validation-breaker/SKILL.md
+COPY skills/hermes-feedback/SKILL.md    /seed-skills/portal/hermes-feedback/SKILL.md
 COPY scripts/iterate.py /iterate.py
 COPY scripts/do-entrypoint.sh /do-entrypoint.sh
 RUN chmod +x /do-entrypoint.sh
