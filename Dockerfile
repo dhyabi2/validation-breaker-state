@@ -1,28 +1,32 @@
 FROM ghcr.io/nesquena/hermes-webui:latest
 
+# Run as root from the start: DO App Platform sets no_new_privileges which
+# blocks the upstream init script's sudo-based UID switching. Running as root
+# is allowed and sidesteps the whole dance.
 USER root
 
-# Install system deps needed for iter loop (git for hermes-agent, build tools for psycopg)
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Install hermes-agent at /hermes (so iterate.py's subprocess /hermes/cli.py retry path works)
+# Hermes Agent at /hermes (for iterate.py's subprocess retry path)
 RUN git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /hermes
-RUN pip install --no-cache-dir --break-system-packages -e /hermes 'psycopg[binary]'
+RUN pip install --no-cache-dir --break-system-packages -e /hermes 'psycopg[binary]' pyyaml
 
-# Seed skill file + iter script
+# Bootstrap.py looks for hermes-agent at $HERMES_HOME/hermes-agent — symlink it
+RUN mkdir -p /root/.hermes && ln -sf /hermes /root/.hermes/hermes-agent
+
+# Seed the validation-breaker skill + iter script
 RUN mkdir -p /seed-skills/security/validation-breaker
 COPY skills/validation-breaker/SKILL.md /seed-skills/security/validation-breaker/SKILL.md
 COPY scripts/iterate.py /iterate.py
 COPY scripts/do-entrypoint.sh /do-entrypoint.sh
 RUN chmod +x /do-entrypoint.sh
 
-# Ensure the webui user can read the iter script + seed skills
-RUN chmod -R 755 /seed-skills /iterate.py /do-entrypoint.sh
+ENV HERMES_WEBUI_HOST=0.0.0.0 \
+    HERMES_WEBUI_PORT=8787 \
+    HERMES_HOME=/root/.hermes \
+    HERMES_WEBUI_AGENT_DIR=/hermes \
+    HERMES_WEBUI_SKIP_ONBOARDING=1
 
-# Expose the webui port (DO App Platform Service consumes this)
 EXPOSE 8787
 
-# Switch back to the upstream user and run our wrapper, which launches
-# iter as a background task and exec's the upstream init script.
-USER hermeswebuitoo
 CMD ["/do-entrypoint.sh"]
