@@ -1,15 +1,28 @@
-FROM python:3.12-slim
+FROM ghcr.io/nesquena/hermes-webui:latest
+
+USER root
+
+# Install system deps needed for iter loop (git for hermes-agent, build tools for psycopg)
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Install Hermes from Nous Research
+# Install hermes-agent at /hermes (so iterate.py's subprocess /hermes/cli.py retry path works)
 RUN git clone --depth 1 https://github.com/NousResearch/hermes-agent.git /hermes
-WORKDIR /hermes
-RUN pip install --no-cache-dir -e . && pip install --no-cache-dir 'psycopg[binary]'
+RUN pip install --no-cache-dir --break-system-packages -e /hermes 'psycopg[binary]'
 
-# Seed Hermes skills directory
-RUN mkdir -p /root/.hermes/skills/security/validation-breaker
-COPY skills/validation-breaker/SKILL.md /root/.hermes/skills/security/validation-breaker/SKILL.md
+# Seed skill file + iter script
+RUN mkdir -p /seed-skills/security/validation-breaker
+COPY skills/validation-breaker/SKILL.md /seed-skills/security/validation-breaker/SKILL.md
 COPY scripts/iterate.py /iterate.py
+COPY scripts/do-entrypoint.sh /do-entrypoint.sh
+RUN chmod +x /do-entrypoint.sh
 
-# Entrypoint: hourly loop (stays alive as a DO App Platform Worker)
-CMD ["bash", "-c", "while true; do echo \"[$(date -u +%FT%TZ)] iter start\"; python /iterate.py || echo \"[$(date -u +%FT%TZ)] iter failed $?\"; echo \"[$(date -u +%FT%TZ)] sleeping 3600s\"; sleep 3600; done"]
+# Ensure the webui user can read the iter script + seed skills
+RUN chmod -R 755 /seed-skills /iterate.py /do-entrypoint.sh
+
+# Expose the webui port (DO App Platform Service consumes this)
+EXPOSE 8787
+
+# Switch back to the upstream user and run our wrapper, which launches
+# iter as a background task and exec's the upstream init script.
+USER hermeswebuitoo
+CMD ["/do-entrypoint.sh"]
