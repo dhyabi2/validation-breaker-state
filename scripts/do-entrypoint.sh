@@ -5,11 +5,11 @@
 # Runs server.py directly in the foreground.
 set +e
 
-# Seed skill
-mkdir -p /root/.hermes/skills/security/validation-breaker 2>/dev/null
-cp -n /seed-skills/security/validation-breaker/SKILL.md \
-      /root/.hermes/skills/security/validation-breaker/SKILL.md 2>/dev/null
-mkdir -p /root/.hermes/webui 2>/dev/null
+# Seed all skills (recursive, idempotent)
+mkdir -p /root/.hermes/skills /root/.hermes/webui 2>/dev/null
+if [ -d /seed-skills ]; then
+  cp -rn /seed-skills/. /root/.hermes/skills/ 2>/dev/null
+fi
 
 # iter loop: hourly, background
 (
